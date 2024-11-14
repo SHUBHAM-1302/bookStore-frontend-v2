@@ -1,0 +1,60 @@
+<h1>
+    book List
+</h1>
+
+<!-- <p-table [value]="books" [(selection)]="selectedProducts" dataKey="code" [tableStyle]="{'min-width': '10rem'}">
+    <ng-template pTemplate="header">
+        <tr>
+            <th>Title</th>
+            <th>Author</th>
+            <th>price</th>
+            <th>Available</th>
+            <th style="width: 4rem"><p-checkbox [binary]="true" inputId="binary" (click)="selectAll()" /></th>
+
+        </tr>
+    </ng-template>
+    <ng-template pTemplate="body" let-product>
+        <tr>
+            <td> <a [routerLink]="['/book', product.id]">{{ product.title }}</a></td>
+            <td>{{ product.auther }}</td>
+            <td>{{ product.rate | currency: 'USD' }}</td>
+            <td>{{ product.isSold ? 'Not Available' :"Available" }}</td>
+            <td><p-checkbox [(ngModel)]="product.check" [binary]="true" inputId="binary" /></td>
+        </tr>
+    </ng-template>
+</p-table> -->
+
+<div class="card">
+    <p-table [value]="books" [tableStyle]="{'min-width': '60rem'}" sortMode="multiple">
+        <ng-template pTemplate="header">
+            <tr>
+                <th pSortableColumn="title" style="width:20%">
+                    Title <p-sortIcon field="title" />
+                </th>
+                <th pSortableColumn="auther" style="width:20%">
+                    Author <p-sortIcon field="auther" />
+                </th>
+                <th pSortableColumn="rate" style="width:20%">
+                    price <p-sortIcon field="rate" />
+                </th>
+                <th pSortableColumn="isSold" style="width:20%">
+                    Available <p-sortIcon field="isSold" />
+                </th>
+                <th style="width: 4rem"><p-checkbox [binary]="true" inputId="binary" (click)="selectAll()" /></th>
+            </tr>
+        </ng-template>
+        <ng-template pTemplate="body" let-product>
+            <tr>
+                <td> <a [routerLink]="['/book', product.id]">{{ product.title }}</a></td>
+                <td>{{ product.auther }}</td>
+                <td>{{ product.rate | currency: 'USD' }}</td>
+                <td>{{ product.isSold ? 'Not Available' :"Available" }}</td>
+                <td><p-checkbox [(ngModel)]="product.check" [binary]="true" inputId="binary" /></td>
+            </tr>
+        </ng-template>
+    </p-table>
+</div>
+<div class="pt-5" class="card flex justify-content-center">
+    <button pButton pRipple label="Buy" class="p-button-success" (click)="updateStatus()">
+    </button>
+</div>

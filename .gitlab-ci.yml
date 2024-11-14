@@ -1,0 +1,244 @@
+variables:
+  DOCKER_HOST: tcp://docker:2375/
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+stages:
+  - dependencies
+  - version-bump
+  - build
+  - docker-build
+  - convert
+  - upload_pdf_to_s3
+  - auto-deploy
+
+install_dependencies:
+  image: node:22.9.0-alpine3.20
+  stage: dependencies
+  script:
+    - npm install
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules
+  only:
+    - release
+    - develop
+    - master
+
+version_bump:
+  image: timbru31/node-alpine-git:20
+  stage: version-bump
+  before_script:
+    - |
+      PREVIOUS_COMMIT=$(git log --format="%H" -n 1) || { echo "Failed to get previous commit"; exit 1; }
+      PARENT_COUNT=$(git cat-file -p $PREVIOUS_COMMIT | grep -o 'parent' | wc -l) || { echo "Failed to count parents"; exit 1; }
+      echo $PREVIOUS_COMMIT
+      echo $PARENT_COUNT
+      LAST_MERGED_BRANCH=$(git log --merges --pretty=format:"%s" -n 1 | sed -E "s/(.*) into.*/\1/" | sed -E 's|/.*||' | tr -d "'[:space:]")
+  script:
+    - |
+      # Conditions and bump version accordingly
+      if [[ $PARENT_COUNT == "2" && $LAST_MERGED_BRANCH == "feature" && $CI_COMMIT_REF_NAME == "develop" ]]; then
+        npm --no-git-tag-version version minor
+      elif [[ $PARENT_COUNT == "2" && $LAST_MERGED_BRANCH == "hotfix" && $CI_COMMIT_REF_NAME == "master" ]]; then
+        npm --no-git-tag-version version patch
+      elif [[ $PARENT_COUNT == "2" && $LAST_MERGED_BRANCH == "bugfix" && $CI_COMMIT_REF_NAME == "develop" ]]; then
+        npm --no-git-tag-version version patch
+      elif [[ $PARENT_COUNT == "2" && $LAST_MERGED_BRANCH == "bugfix" && $CI_COMMIT_REF_NAME == "release" ]]; then
+        npm --no-git-tag-version version patch
+
+      else
+        echo "No version bump needed"
+        echo "For more details, refer to: https://docs.kanilebettu.in/Documentation/0.1/Devops/Git-folw.html"
+        exit 0
+      fi
+    - git config --global user.email "techuser@kanilebettu.com"
+    - git config --global user.name "usertech"
+    - git commit -am "Bump version" || { echo "Failed to commit"; exit 1; }
+    - git remote set-url origin https://oauth2:$PERSONAL_ACCESS_TOKEN@gitlab.com/merco_ecosystem/$CI_PROJECT_NAME.git
+    - git push origin HEAD:$CI_COMMIT_REF_NAME --force || { echo "Failed to push changes"; exit 1; }
+  only:
+    - release
+    - develop
+    - master
+
+build_image:
+  image: node:22.9.0-alpine3.20
+  stage: build
+  script:
+    - if [ "$CI_COMMIT_BRANCH" == "release" ]; then npm run build -- --c qa; fi
+    - if [ "$CI_COMMIT_BRANCH" == "master" ]; then npm run build; fi #here by default it will take prod env file (REF:angular.json)
+  artifacts:
+    paths:
+      - ./dist
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules
+    policy: pull
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /^Bump version.*/ && $CI_COMMIT_BRANCH == "release"'
+    - if: $CI_COMMIT_MESSAGE =~ /^'develop'.*/ && $CI_COMMIT_BRANCH == "release"
+    - if: '$CI_COMMIT_MESSAGE =~ /^Bump version.*/ && $CI_COMMIT_BRANCH == "master"'
+    - if: $CI_COMMIT_MESSAGE =~ /^'release'.*/ && $CI_COMMIT_BRANCH == "master"
+
+.docker_build_template: &docker_build_configuration
+  stage: docker-build
+  services:
+    - name: docker:23.0.1-dind
+      alias: docker
+  image:
+    name: amazon/aws-cli:2.7.32
+    entrypoint: [""]
+  before_script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "develop" ]; then
+        TAG=v.$(cat package.json | grep '"version":' | awk -F'"' '{print $4}')-alph
+        echo $TAG
+        echo $TAG > tag.env
+      elif [ "$CI_COMMIT_BRANCH" == "release" ]; then   
+        TAG=v.$(cat package.json | grep '"version":' | awk -F'"' '{print $4}')-beta
+        echo $TAG
+        echo $TAG > tag.env        
+      else
+        TAG=v.$(cat package.json | grep '"version":' | awk -F'"' '{print $4}')
+        echo $TAG
+        echo $TAG > tag.env      
+      fi
+  script:
+    - amazon-linux-extras install docker
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $DOCKER_REGISTRY
+    - docker build -t $CI_PROJECT_TITLE .
+    - docker tag $CI_PROJECT_TITLE:latest $DOCKER_REGISTRY/$ECR_REPO:$CI_PROJECT_TITLE-$TAG
+    - docker push $DOCKER_REGISTRY/$ECR_REPO:$CI_PROJECT_TITLE-$TAG
+  artifacts:
+    paths:
+      - tag.env
+
+docker-build-qa:
+  <<: *docker_build_configuration
+  environment:
+    name: Quality Assurance
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^Bump version.*/ && $CI_COMMIT_BRANCH == "release"
+    - if: $CI_COMMIT_MESSAGE =~ /^'develop'.*/ && $CI_COMMIT_BRANCH == "release"
+
+docker-build-prod:
+  <<: *docker_build_configuration
+  environment:
+    name: Production
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^'release'.*/ && $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_MESSAGE =~ /^Bump version.*/ && $CI_COMMIT_BRANCH == "master"
+
+.deploy_to_eks: &deploy_configuration
+  stage: auto-deploy
+  image:
+    name: vishwanathaws/helm:v1
+    entrypoint: [""]
+  before_script:
+    - TAG="$(cat tag.env)"
+    - echo "${TAG}"
+    - aws s3 cp s3://$S3_BUCKET_NAME/ . --recursive #(s3bucket helm chart)
+    - helm version
+  script:
+    - aws eks update-kubeconfig --region ap-south-1 --name $CLUSTER_NAME
+    - helm upgrade --install ${APP_NAME} ./helm_repo/$CI_PROJECT_TITLE/  -f ./helm_repo/$CI_PROJECT_TITLE/$VALUES_FILE --set image.repository=$LATEST_IMAGE-$TAG -n $NAMESPACE
+
+deploy-qa:
+  <<: *deploy_configuration
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^Bump version.*/ && $CI_COMMIT_BRANCH == "release"
+    - if: $CI_COMMIT_MESSAGE =~ /^'develop'.*/ && $CI_COMMIT_BRANCH == "release"
+  variables:
+    CLUSTER_NAME: $CLUSTER_NAME
+    APP_NAME: qa-web
+    LATEST_IMAGE: $DOCKER_REGISTRY/$ECR_REPO:$CI_PROJECT_TITLE
+    VALUES_FILE: qa-values.yaml
+    NAMESPACE: qa-support-svc
+  environment:
+    name: Quality Assurance
+
+deploy-prod:
+  <<: *deploy_configuration
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /^'release'.*/ && $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_MESSAGE =~ /^Bump version.*/ && $CI_COMMIT_BRANCH == "master"
+  variables:
+    CLUSTER_NAME: $CLUSTER_NAME
+    APP_NAME: prod-web
+    LATEST_IMAGE: $DOCKER_REGISTRY/$ECR_REPO:$CI_PROJECT_TITLE
+    VALUES_FILE: prod-values.yaml
+    NAMESPACE: prod-support-svc
+  environment:
+    name: Production
+
+#_---------------------------------_#
+
+convert_to_pdf:
+  stage: convert
+  image:
+    name: pandoc/latex:edge-alpine
+    entrypoint: [""]
+  script:
+    # Ensure the output directory exists
+    - mkdir -p combined_output
+
+    # Find the project directory in the current directory
+    - echo "Searching for the directory..."
+    - SB_DIR=$(find . -type d -name "src")
+    - if [ -z "$SB_DIR" ]; then echo "src directory not found!"; exit 1; fi
+
+    # Find all .java files in the directory
+    - ts_files=$(find $SB_DIR -type f -name "*.ts")
+    - if [ -z "$ts_files" ]; then echo "No .ts files found!"; exit 1; fi
+
+    # Create a temporary markdown file for pandoc
+    - echo "Creating a temporary markdown file..."
+    - TEMP_MD="combined_output/temp.md"
+    - touch $TEMP_MD
+
+    # Wrap .java files in markdown code blocks
+    - for FILE in $ts_files; do
+      echo "Processing $FILE...";
+      echo "\`\`\`ts" >> $TEMP_MD;
+      cat $FILE >> $TEMP_MD;
+      echo "\`\`\`" >> $TEMP_MD;
+      done
+
+    # Convert the markdown file to PDF
+    - echo "Converting the markdown file to PDF..."
+    - pandoc $TEMP_MD -o combined_output/web.pdf --pdf-engine=pdflatex
+  artifacts:
+    paths:
+      - combined_output/web.pdf
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"' # Manual trigger
+      when: manual
+    - if: "$CI_COMMIT_TAG =~ /^release-/" # Tagged release
+      when: on_success
+    - when: never # Prevents the job from running by default
+
+upload_pdf_to_s3:
+  stage: upload_pdf_to_s3 #  New stage for upload
+  image:
+    name: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest # Image with AWS CLI pre-installed
+  dependencies: # Depend on previous stage for artifact
+    - convert_to_pdf
+  script:
+    # Ensure the artifact is in the current working directory
+    - ls -la combined_output
+    - if [ ! -f combined_output/web.pdf ]; then echo "PDF not found!"; exit 1; fi
+
+    # Install AWS CLI (the image should already have it)
+    - echo "uploading file to s3"
+    - aws s3 cp combined_output/web.pdf s3://assets.kb.merco.com/pdf/web.pdf
+  rules:
+    - if: "$CI_COMMIT_TAG =~ /^release-/" # Tagged release
+      when: on_success

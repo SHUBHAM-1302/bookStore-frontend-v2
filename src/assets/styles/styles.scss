@@ -1,0 +1,10 @@
+
+@use '@angular/material' as mat;
+@include mat.core();
+
+
+@import '_base';
+@import '_prime-ng';
+@import '_variables';
+
+
